@@ -17,6 +17,8 @@ Layout, all under $TMUX_ORCH_HOME (default <repos>/.tmux-orch):
     <KEY>/sessions/<repo>/       exercise.json, brief.md (in), report.md / question.md (out), cost.json
     <KEY>/worktrees/<repo>/      git worktree on branch share/<KEY>, cut from the remote default branch
     <KEY>/costs.json             what read and exercise cost; sessions keep theirs in sessions/<repo>/cost.json
+    <KEY>/graphs/<repo>/         graphify code graph of the worktree's commit (graphify-out/graph.json, meta.json):
+                                 built locally with no LLM, read-only to sessions
 
 Costs are Claude Code's own total_cost_usd: API-priced. On a subscription (Pro, Max, Team) that
 is an estimate of the equivalent API cost, not what you are billed.
@@ -47,6 +49,9 @@ REPO_MODEL = os.environ.get("TMUX_ORCH_REPO_MODEL", "sonnet")
 EXERCISE_MODEL = os.environ.get("TMUX_ORCH_EXERCISE_MODEL", "opus")
 EXERCISE_PARALLEL = int(os.environ.get("TMUX_ORCH_EXERCISE_PARALLEL", "4"))
 EXERCISE_BUDGET = os.environ.get("TMUX_ORCH_EXERCISE_BUDGET_USD")  # per repo, optional cap
+GRAPHIFY = os.environ.get("TMUX_ORCH_GRAPHIFY") or shutil.which("graphify") or (
+    str(Path.home() / ".local/bin/graphify") if (Path.home() / ".local/bin/graphify").exists() else "")
+GRAPH_ON = os.environ.get("TMUX_ORCH_GRAPH", "1") != "0"
 POLL_SECONDS = float(os.environ.get("TMUX_ORCH_POLL", "10"))
 IDLE_MINUTES = float(os.environ.get("TMUX_ORCH_IDLE_MINUTES", "10"))
 
@@ -205,7 +210,7 @@ def print_preview(data: dict):
             after = f"  after {', '.join(s['depends_on'])}" if s.get("depends_on") else ""
             base = f"  from origin/{s['base'].removeprefix('origin/')}" if s.get("base") else ""
             ex = exercise_state(data, s)
-            print(f"  - {r}  [{s.get('model') or REPO_MODEL}]{base}{after}  ({ex})")
+            print(f"  - {r}  [{s.get('model') or REPO_MODEL}]{base}{after}  ({ex}; {graph_label(data['key'], r)})")
             for t in s["tasks"]:
                 print(f"      {t.get('id') or '-'}  {t['title']}")
     if data.get("unassigned"):
@@ -455,7 +460,77 @@ def prepare_worktree(repo: str, key: str, base: str = "") -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
-# Session prompts and settings
+# graphify: a code graph of each worktree's commit
+
+
+def graph_dir(key: str, repo: str) -> Path:
+    """Outside the worktree (git add -A must never pick it up) and outside the session folder (read-only to it)."""
+    return HOME / key / "graphs" / repo
+
+
+def graph_meta(key: str, repo: str) -> dict:
+    try:
+        return json.loads((graph_dir(key, repo) / "meta.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def ensure_graph(key: str, repo: str, worktree: str) -> dict:
+    """The worktree's graph at its current commit, building it if missing or behind. Code only, local
+    AST extraction: no LLM, no cost, seconds. Never raises: a session without a graph reads the code."""
+    gdir = graph_dir(key, repo)
+    graph = gdir / "graphify-out" / "graph.json"
+    try:
+        sha = git(worktree, "rev-parse", "HEAD")
+    except subprocess.CalledProcessError as e:
+        return {"error": f"no HEAD in {worktree}: {e}"}
+    meta = graph_meta(key, repo)
+    if graph.exists() and meta.get("sha") == sha and not meta.get("error"):
+        return {**meta, "path": str(graph)}
+    if not GRAPH_ON:
+        return {"error": "disabled (TMUX_ORCH_GRAPH=0)"}
+    if not GRAPHIFY:
+        return {"error": "graphify is not installed"}
+    gdir.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    meta = {"sha": sha, "built_at": datetime.now().isoformat(timespec="seconds")}
+    try:
+        proc = subprocess.run([GRAPHIFY, "extract", worktree, "--code-only", "--out", str(gdir)],
+                              capture_output=True, text=True, timeout=15 * 60)
+        if proc.returncode != 0 or not graph.exists():
+            raise RuntimeError((proc.stderr or proc.stdout).strip()[-400:] or f"exit {proc.returncode}")
+        g = json.loads(graph.read_text())
+        meta.update(nodes=len(g.get("nodes", [])), edges=len(g.get("links", g.get("edges", []))))
+    except Exception as e:  # noqa: BLE001 — a missing graph must never stop a run
+        meta["error"] = str(e)
+    meta["seconds"] = round(time.time() - started, 1)
+    (gdir / "meta.json").write_text(json.dumps(meta, indent=2))
+    return meta if meta.get("error") else {**meta, "path": str(graph)}
+
+
+def graph_label(key: str, repo: str) -> str:
+    m = graph_meta(key, repo)
+    if not m:
+        return "no graph yet"
+    if m.get("error"):
+        return f"no graph ({m['error'][:60]})"
+    return f"graph {m.get('nodes', '?')} nodes @{m['sha'][:8]}"
+
+
+def graph_guide(graph: dict) -> str:
+    """How to use the graph well: by symbol, not by sentence. Empty when there is none."""
+    if not graph.get("path"):
+        return ""
+    g = shlex.quote(graph["path"])
+    return f"""## Code graph (graphify)
+
+A graph of this repo's code at {graph['sha'][:12]} ({graph.get('nodes', '?')} nodes): who calls, imports or implements what.
+Read-only. Run exactly these forms (never graphify update/extract, never write under its folder):
+- `graphify explain "<Symbol>" --graph {g}`  the symbol's callers, callees and file:line. An ambiguous name lists every match with its id; rerun with the id.
+- `graphify path "<A>" "<B>" --graph {g}`  how A reaches B: blast radius before you change A.
+- `graphify query "<few exact identifiers>" --graph {g} --budget 1500`  keyword BFS; whole sentences match too broadly.
+Use it to find what a change touches; Read the file before you rely on an edge, and treat INFERRED edges as hints.
+"""
 
 REPO_SETTINGS = {
     "permissions": {
@@ -519,7 +594,7 @@ ORCH_RULES = """You are the orchestrator for plan {key} ({plan}). One Claude Cod
 - sessions.json (the split and order) is {home}/sessions.json. If the user asks to change it, edit it and restart the watcher with: {watch}"""
 
 
-def brief_for(data: dict, s: dict, info: dict, parents: list, exercise=None) -> str:
+def brief_for(data: dict, s: dict, info: dict, parents: list, exercise=None, graph=None) -> str:
     tasks = tasks_text(s)
     upstream = "\n".join(f"- {p['repo']} (branch share/{data['key']}): report at {p['report']}\n{indent(p['summary'])}" for p in parents)
     notes = "\n".join(f"- {n}" for n in data.get("notes", []))
@@ -543,7 +618,7 @@ Branch: {info['branch']} (cut from {info['base_ref']} @ {info['base_sha'][:12]},
 ## Rules from the plan
 
 {notes}
-''' if notes else ''}{chr(10) + render_exercise(exercise) if exercise else ''}"""
+''' if notes else ''}{chr(10) + render_exercise(exercise) if exercise else ''}{chr(10) + graph_guide(graph or {})}"""
 
 
 def indent(text: str) -> str:
@@ -587,6 +662,7 @@ Repo: {repo}. You are in its worktree, {worktree}, cut from {base_ref} at {sha}:
 This repo's part of the plan:
 {tasks}
 
+{graph}
 Read the plan below, then the code it touches. Return:
 - summary: two or three sentences: what this repo's change is, and whether the plan fits the code as it is.
 - changes: each file to change and what changes in it, citing file:line for the code it touches.
@@ -599,8 +675,8 @@ Only what the plan asks for.
 
 READONLY_BASH = [f"Bash({c}:*)" for c in (
     "git log", "git show", "git diff", "git grep", "git blame", "git ls-files", "git status", "git rev-parse",
-    "ls", "cat", "head", "tail", "wc", "find", "rg", "grep", "jq", "tree", "graphify query", "graphify path",
-    "graphify explain")]
+    "ls", "cat", "head", "tail", "wc", "find", "rg", "grep", "jq", "tree", "go doc", "go list", "go env",
+    *(f"{g} {sub}" for g in {"graphify", GRAPHIFY or "graphify"} for sub in ("query", "path", "explain")))]
 
 
 def exercise_settings() -> dict:
@@ -662,8 +738,11 @@ def exercise_repo(data: dict, s: dict) -> dict:
         plan = Path(data["plan"])
         texts = plan_texts(plan) if plan.exists() else {}
         files = "\n\n".join(f'<{name} path="{plan.parent / (name + ".md")}">\n{text}\n</{name}>' for name, text in texts.items())
+        graph = ensure_graph(key, repo, info["worktree"])
+        out["graph"] = {k: graph.get(k) for k in ("nodes", "sha", "error") if graph.get(k) is not None}
         prompt = EXERCISE_PROMPT.format(repo=repo, worktree=info["worktree"], base_ref=info["base_ref"],
-                                        sha=info["base_sha"][:12], tasks=tasks_text(s), files=files)
+                                        sha=info["base_sha"][:12], tasks=tasks_text(s), files=files,
+                                        graph=graph_guide(graph))
         settings = sdir / "exercise-settings.json"
         settings.write_text(json.dumps(exercise_settings(), indent=2))
         cmd = [CLAUDE, "-p", "--model", EXERCISE_MODEL, "--output-format", "json", "--no-session-persistence",
@@ -816,7 +895,8 @@ def launch_repo(data: dict, s: dict, state: dict, sess: str):
     info = prepare_worktree(repo, key, s.get("base", ""))
     parents = [{"repo": d, "report": str(home / "sessions" / d / "report.md"),
                 "summary": report_summary(home / "sessions" / d / "report.md")} for d in s.get("depends_on", [])]
-    (sdir / "brief.md").write_text(brief_for(data, s, info, parents, load_exercise(data, s)))
+    graph = ensure_graph(key, repo, info["worktree"])  # the exercise usually built it already: reused
+    (sdir / "brief.md").write_text(brief_for(data, s, info, parents, load_exercise(data, s), graph))
     settings = sdir / "settings.json"
     settings.write_text(json.dumps(repo_settings(info["worktree"], sdir), indent=2))
     rules = SESSION_RULES.format(brief=sdir / "brief.md", worktree=info["worktree"], session_dir=sdir,
@@ -922,7 +1002,7 @@ def run_status(key: str):
     sess = session_name(key)
     costs = read_costs(key)
     print(f"{key}  tmux: {sess} ({'running' if has_session(sess) else 'not running'})")
-    print(f"  {'':7} {'repo':<28} {'model':<8} {'status':<11} {'exercise':>9} {'session':>9}")
+    print(f"  {'':7} {'repo':<28} {'model':<8} {'status':<11} {'exercise':>9} {'session':>9}  {'graph':<12}")
     sessions_total = 0.0
     for wave_n, wave in enumerate(waves(data["sessions"]), 1):
         for r in wave:
@@ -933,8 +1013,10 @@ def run_status(key: str):
             q = HOME / key / "sessions" / r / "question.md"
             spent = session_cost(key, r)
             sessions_total += spent
+            gm = graph_meta(key, r)
+            graph = "-" if not gm else ("failed" if gm.get("error") else f"{gm.get('nodes', '?')} nodes")
             print(f"  wave {wave_n:<2} {r:<28} {(s.get('model') or REPO_MODEL):<8} {st['status']:<11} "
-                  f"{usd(costs['exercise'].get(r, 0.0)):>9} {usd(spent):>9}{extra}"
+                  f"{usd(costs['exercise'].get(r, 0.0)):>9} {usd(spent):>9}  {graph:<12}{extra}"
                   f"{'  QUESTION OPEN' if q.exists() else ''}{'  ' + st['error'] if st.get('error') else ''}")
     orch = session_cost(key, ORCH)
     exercise_total = sum(costs["exercise"].values())

@@ -9,7 +9,7 @@ Claude Code pipes each tool call in as JSON on stdin. The hook answers:
     deny   Edit/Write/MultiEdit/NotebookEdit outside the writable dirs (a symlink inside them
            that points out counts as outside); Bash that writes into a protected path (the main
            checkouts and other sessions' worktrees: anything under --protect that is not writable);
-           git rebase; force-push in any spelling.
+           git rebase; force-push in any spelling; graphify other than query, path and explain.
     ask    any git push, gh pr create/merge/..., and commands that reach past the machine
            (kubectl, terraform, gcloud, aws, DB clients, publish, HTTP writes), wherever they sit
            in the command line: `git -C x push`, `env A=1 kubectl apply`, `cd y && gh pr create`.
@@ -36,6 +36,10 @@ SHELL_WRITES = re.compile(
 HARMLESS_REDIRECTS = re.compile(r"\d*>>?\s*&\s*\d+|&>\s*/dev/null|\d*>>?\s*/dev/null")
 
 REBASE = re.compile(r"\bgit\b.*\brebase\b")
+# graphify: sessions read a graph (query, path, explain); building or changing one is the runner's job.
+# Only where graphify is the command of a part (`/x/bin/graphify update`), not an argument (`grep graphify docs/`).
+GRAPHIFY_SUB = re.compile(r"^(?:\S*/)?(?:graphify(?:\.py)?|python[\d.]*\s+(?:-\S+\s+)*-m\s+graphify)\s+([a-z][\w-]*)")
+GRAPHIFY_READ = {"query", "path", "explain"}
 FORCE_PUSH = re.compile(r"\bgit\b.*\bpush\b.*(\s--force|\s-[a-zA-Z]*f[a-zA-Z]*\b|\s\+\S)")
 PUSH = re.compile(r"\bgit\b.*\bpush\b|\bgh\b.*\bpr\s+(create|merge|ready|edit|close|reopen|comment|review)\b")
 DANGER = re.compile(
@@ -125,14 +129,19 @@ def decide(tool: str, tool_input: dict, cwd: str, writable: list, protect: list)
     cmd = str(tool_input.get("command", ""))
     line = re.sub(r"\s+", " ", cmd)
 
+    for sub in (m.group(1) for m in map(GRAPHIFY_SUB.match, parts(cmd)) if m):
+        if sub not in GRAPHIFY_READ:
+            return "deny", (f"graphify {sub} rebuilds or changes a graph; sessions only read one "
+                            "(graphify query, path, explain). The runner keeps it at your worktree's commit.")
     if REBASE.search(line):
         return "deny", "Never rebase in a plan session; merge the base branch in instead."
     if FORCE_PUSH.search(line):
         return "deny", "Never force-push from a plan session."
 
     # Writes into a main checkout or another session's worktree, by path or after a cd there.
+    # Harmless redirects go first: splitting on `&` would cut `2>&1` into a bare `2>` that looks like a write.
     here, hits = cwd, []
-    for part in parts(cmd):
+    for part in parts(HARMLESS_REDIRECTS.sub(" ", cmd)):
         m = re.match(r"cd\s+(\S+)\s*$", part)
         if m:
             here = resolve(here, m.group(1).strip("'\""))

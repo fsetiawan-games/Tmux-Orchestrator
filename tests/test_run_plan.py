@@ -102,10 +102,71 @@ class PlanLogic(unittest.TestCase):
         r = run(json.dumps({"session_id": "b", "model": {"display_name": "Opus 5.5"}, "cost": {"total_cost_usd": 0.25}}))
         self.assertEqual(r.stdout.strip(), "Opus 5.5 · $1.75 (this run $0.25)")
 
+    def test_graph_is_built_outside_the_worktree_reused_and_rebuilt_after_a_commit(self):
+        root = Path(tempfile.mkdtemp())
+        wt = root / "wt"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(wt)], check=True)
+        g = ["git", "-C", str(wt), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(g + ["commit", "-q", "--allow-empty", "-m", "a"], check=True)
+        calls = root / "calls"
+        fake = root / "graphify"
+        fake.write_text(FAKE_GRAPHIFY)
+        fake.chmod(0o755)
+        old = rp.HOME, rp.GRAPHIFY, rp.GRAPH_ON
+        os.environ["FAKE_GRAPHIFY_CALLS"] = str(calls)
+        try:
+            rp.HOME, rp.GRAPHIFY, rp.GRAPH_ON = root / "home", str(fake), True
+            first = rp.ensure_graph("K", "api", str(wt))
+            self.assertEqual(first["nodes"], 3)
+            self.assertTrue(first["path"].startswith(str(root / "home" / "K" / "graphs" / "api")))
+            self.assertFalse((wt / "graphify-out").exists())
+            self.assertEqual(rp.ensure_graph("K", "api", str(wt))["sha"], first["sha"])
+            self.assertEqual(calls.read_text().count("extract"), 1)          # same commit: reused
+            subprocess.run(g + ["commit", "-q", "--allow-empty", "-m", "b"], check=True)
+            self.assertNotEqual(rp.ensure_graph("K", "api", str(wt))["sha"], first["sha"])
+            self.assertEqual(calls.read_text().count("extract"), 2)          # new commit: rebuilt
+            self.assertIn("graph 3 nodes @", rp.graph_label("K", "api"))
+            guide = rp.graph_guide(rp.ensure_graph("K", "api", str(wt)))
+            self.assertIn("graphify explain", guide)
+            self.assertIn("--graph", guide)
+
+            os.environ["FAKE_GRAPHIFY_FAIL"] = "1"
+            subprocess.run(g + ["commit", "-q", "--allow-empty", "-m", "c"], check=True)
+            failed = rp.ensure_graph("K", "api", str(wt))
+            self.assertIn("error", failed)
+            self.assertNotIn("path", failed)
+            self.assertEqual(rp.graph_guide(failed), "")
+            self.assertTrue(rp.graph_label("K", "api").startswith("no graph (boom"))
+
+            rp.GRAPHIFY = ""
+            self.assertEqual(rp.ensure_graph("K", "web", str(wt))["error"], "graphify is not installed")
+            rp.GRAPHIFY, rp.GRAPH_ON = str(fake), False
+            self.assertIn("disabled", rp.ensure_graph("K", "web", str(wt))["error"])
+        finally:
+            rp.HOME, rp.GRAPHIFY, rp.GRAPH_ON = old
+            os.environ.pop("FAKE_GRAPHIFY_FAIL", None)
+            os.environ.pop("FAKE_GRAPHIFY_CALLS", None)
+
     def test_parse_reading_structured_and_fallback(self):
         body = {"sessions": [], "unassigned": [], "notes": []}
         self.assertEqual(rp.parse_reading(json.dumps({"structured_output": body})), body)
         self.assertEqual(rp.parse_reading(json.dumps({"result": "here:\n" + json.dumps(body)})), body)
+
+
+FAKE_GRAPHIFY = r"""#!/usr/bin/env python3
+import json, os, sys
+calls = os.environ.get("FAKE_GRAPHIFY_CALLS")
+if calls:
+    open(calls, "a").write(" ".join(sys.argv[1:]) + "\n")
+if os.environ.get("FAKE_GRAPHIFY_FAIL"):
+    print("boom: extractor crashed", file=sys.stderr)
+    sys.exit(2)
+assert sys.argv[1] == "extract" and "--code-only" in sys.argv
+out = os.path.join(sys.argv[sys.argv.index("--out") + 1], "graphify-out")
+os.makedirs(out, exist_ok=True)
+json.dump({"nodes": [{"id": "a"}, {"id": "b"}, {"id": "c"}], "links": [{"source": "a", "target": "b"}]},
+          open(os.path.join(out, "graph.json"), "w"))
+"""
 
 
 FAKE_CLAUDE = r'''#!/usr/bin/env python3
@@ -116,6 +177,8 @@ if "-p" in args:
     if "--no-session-persistence" in args:   # an exercise: answer about this worktree, at 0.25
         repo = os.path.basename(os.getcwd())
         assert "You are exercising" in prompt and os.path.exists(".git"), "exercise must run in the worktree"
+        assert "## Code graph (graphify)" in prompt and "graphs/" + repo in prompt, "exercise must get its graph"
+        assert not os.path.exists("graphify-out"), "the graph must not land in the worktree"
         settings = json.load(open(args[args.index("--settings") + 1]))
         assert "Edit" not in settings["permissions"]["allow"] and "--writable" not in json.dumps(settings)
         body = {"summary": f"{repo} fits the plan", "changes": [{"file": f"{repo}.go:1", "change": "add X"}],
@@ -153,7 +216,7 @@ subprocess.run(["git", "add", "work.txt"], check=True)
 subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", f"work in {repo}"], check=True)
 brief = open(os.path.join(os.path.dirname(report), "brief.md")).read()
 time.sleep(1)
-open(report, "w").write(f"---\nstatus: done\n---\n## Summary\n{repo} finished. upstream-seen={'Upstream sessions' in brief} model={model} exercise-seen={'## Exercise' in brief}\n")
+open(report, "w").write(f"---\nstatus: done\n---\n## Summary\n{repo} finished. upstream-seen={'Upstream sessions' in brief} model={model} exercise-seen={'## Exercise' in brief} graph-seen={'## Code graph' in brief}\n")
 time.sleep(600)
 '''
 
@@ -178,6 +241,9 @@ class EndToEnd(unittest.TestCase):
         fake = self.root / "claude"
         fake.write_text(FAKE_CLAUDE)
         fake.chmod(0o755)
+        fake_graphify = self.root / "graphify"
+        fake_graphify.write_text(FAKE_GRAPHIFY)
+        fake_graphify.chmod(0o755)
         self.plan = self.root / "tasks" / "DEMO-1-x" / "plan.md"
         self.plan.parent.mkdir(parents=True)
         self.plan.write_text("## Implementation steps\n### 1. `lib`\n### 2. `api`\ndepends on step 1\n### 3. `web`\n")
@@ -185,7 +251,7 @@ class EndToEnd(unittest.TestCase):
                    "unassigned": [{"title": "deploy", "why": "ops"}], "notes": ["keep it small"]}
         self.socket = f"tmux-orch-test-{os.getpid()}"
         self.env = {**os.environ, "TMUX_ORCH_REPOS": str(self.repos), "TMUX_ORCH_HOME": str(self.home),
-                    "TMUX_ORCH_CLAUDE": str(fake), "TMUX_ORCH_POLL": "0.5", "TMUX_ORCH_SOCKET": self.socket,
+                    "TMUX_ORCH_CLAUDE": str(fake), "TMUX_ORCH_GRAPHIFY": str(fake_graphify), "TMUX_ORCH_POLL": "0.5", "TMUX_ORCH_SOCKET": self.socket,
                     "FAKE_READING": json.dumps(reading), "FAKE_ORCH_LOG": str(self.root / "orch.log")}
         self.env["TMUX_ORCH_FAKE_READING"] = self.env["FAKE_READING"]  # reaches tmux windows
         self.env["TMUX_ORCH_FAKE_ORCH_LOG"] = self.env["FAKE_ORCH_LOG"]
@@ -203,7 +269,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Wave 1", r.stdout)
         self.assertIn("deploy", r.stdout)
-        self.assertIn("(not exercised)", r.stdout)
+        self.assertIn("(not exercised; no graph yet)", r.stdout)
 
         # Pick a model: unknown names are refused, a repo gets its own, re-reading keeps it.
         self.assertNotEqual(self.cli("model", "DEMO-1", "api", "gpt-9").returncode, 0)
@@ -224,7 +290,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("Already exercised", self.cli("exercise", "DEMO-1").stdout)
         ex = json.loads((self.home / "DEMO-1" / "sessions" / "lib" / "exercise.json").read_text())
         self.assertEqual((ex["summary"], ex["model"], len(ex["base_sha"])), ("lib fits the plan", "opus", 40))
-        self.assertIn("(exercised, 1 open question)", self.cli("preview", "DEMO-1").stdout)
+        self.assertIn("(exercised, 1 open question; graph 3 nodes @", self.cli("preview", "DEMO-1").stdout)
 
         r = self.cli("start", "DEMO-1")
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
@@ -249,6 +315,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("model=opus", rep("api").read_text())
         self.assertIn("model=sonnet", rep("web").read_text())
         self.assertIn("exercise-seen=True", rep("lib").read_text())
+        self.assertIn("graph-seen=True", rep("web").read_text())
 
         # Each worked in its own worktree on share/DEMO-1; the main checkout is untouched.
         for r in ("lib", "api", "web"):
@@ -294,7 +361,7 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("done", r.stdout)
         # read 0.20 (read twice) + exercise 3 x 0.25 + sessions 3 x (0.40 + 0.20) + orchestrator 0.05
         self.assertIn("read $0.20 · exercise $0.75 · repo sessions $1.80 · orchestrator $0.05 · total $2.80", r.stdout)
-        self.assertRegex(r.stdout, r"api\s+opus\s+done\s+\$0\.25\s+\$0\.60")
+        self.assertRegex(r.stdout, r"api\s+opus\s+done\s+\$0\.25\s+\$0\.60\s+3 nodes")
 
 
 if __name__ == "__main__":

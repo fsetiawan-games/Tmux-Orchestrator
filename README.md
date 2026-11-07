@@ -245,6 +245,14 @@ python3 run_plan.py stop     ABC-123                       # kills tmux only; wo
   Writes are denied by `guard.py`. An exercise is kept until the plan, the repo's tasks or its
   base change. `TMUX_ORCH_EXERCISE_MODEL` (default `opus`), `TMUX_ORCH_EXERCISE_BUDGET_USD` caps
   each repo.
+- **graphify**: when a worktree is made (by `exercise` or `start`), `graphify extract --code-only`
+  builds a code graph of its exact commit in `<KEY>/graphs/<repo>/`: local AST extraction, no LLM,
+  no cost, seconds (1–6 s on two Go services). It lives outside the worktree, so
+  `git add -A` never picks it up, and is rebuilt only when the worktree's commit moves. The
+  exercise and the session's brief get its path and how to use it (`explain` and `path` by
+  symbol for callers and blast radius; `query` with exact identifiers). Sessions only read it:
+  `guard.py` denies `graphify update/extract/watch/...` and writes to the graph. Without
+  graphify (or with `TMUX_ORCH_GRAPH=0`) sessions read the code as before.
 - **cost**: read and exercise record `total_cost_usd` from `claude -p`; each interactive session
   (and the orchestrator) records it through its status line, which shows `model · $cost`.
   `status` adds them up. On a Pro, Max or Team plan this is Claude Code's API-priced estimate,

@@ -78,6 +78,13 @@ class BashWrites(unittest.TestCase):
                     "rm -f /r/monolith/config.php"]:
             self.assertEqual(bash(cmd), "deny", cmd)
 
+    def test_stderr_redirects_are_not_writes_even_outside_the_worktree(self):
+        # `2>&1` used to be split on `&` into a bare `2>` that counted as a write.
+        for cmd in ["go list ./... 2>&1 | head", "go test ./... 2>&1 | tail -20", "make lint &> /dev/null",
+                    "go vet ./... 2>/dev/null", "npm test >&2"]:
+            self.assertIsNone(g.decide("Bash", {"command": cmd}, "/r/go-lib", [], P), cmd)
+        self.assertEqual(g.decide("Bash", {"command": "go list ./... 2>&1 > out.txt"}, "/r/go-lib", [], P)[0], "deny")
+
     def test_a_session_whose_cwd_drifted_into_a_main_checkout_cannot_write(self):
         self.assertEqual(bash("git commit -am x", cwd="/r/go-lib"), "deny")
         self.assertEqual(bash("rm -rf vendor", cwd="/r/go-lib"), "deny")
@@ -107,6 +114,24 @@ class BashGit(unittest.TestCase):
             self.assertEqual(bash(cmd), "ask", cmd)
         for cmd in ["kubectl get pods", "curl https://example.com", "helm list", "gh api repos/x"]:
             self.assertIsNone(bash(cmd), cmd)
+
+
+class BashGraphify(unittest.TestCase):
+    def test_sessions_read_the_graph_and_never_rebuild_it(self):
+        for cmd in ['graphify explain "CreateOrder" --graph /r/.tmux-orch/K/graphs/api/graphify-out/graph.json',
+                    "/Users/x/.local/bin/graphify path A B --graph g.json", 'graphify query "Foo Bar" --budget 1500',
+                    "graphify --help", "grep -rn graphify docs/", 'grep -rn "graphify update" docs/',
+                    "python3 -m graphify query X", "python3 -m pytest"]:
+            self.assertIsNone(bash(cmd), cmd)
+        for cmd in ["graphify update .", "cd x && graphify extract . --code-only", "/Users/x/.local/bin/graphify watch .",
+                    "env X=1 graphify update .", 'sh -c "graphify add http://x"', "python -m graphify update .",
+                    "python3.12 -I -m graphify extract .", "graphify cluster-only ."]:
+            self.assertEqual(bash(cmd), "deny", cmd)
+
+    def test_the_graph_files_are_outside_what_a_session_may_write(self):
+        g = "/r/.tmux-orch/K/graphs/api/graphify-out/graph.json"
+        self.assertEqual(write(g), "deny")
+        self.assertEqual(bash(f"echo x > {g}"), "deny")
 
 
 class HookProtocol(unittest.TestCase):
