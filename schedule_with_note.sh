@@ -23,12 +23,15 @@ echo "$NOTE" >> "$NOTE_FILE"
 
 echo "Scheduling check in $MINUTES minutes with note: $NOTE"
 
-# Calculate the exact time when the check will run
+SECONDS_TO_WAIT=$(echo "$MINUTES * 60" | bc)
+
+# Calculate the exact time when the check will run. date only adds whole units, so work in
+# rounded seconds: 0.05 minutes is +3S, 1.5 minutes is +90S (BSD date first, then GNU)
 CURRENT_TIME=$(date +"%H:%M:%S")
-RUN_TIME=$(date -v +${MINUTES}M +"%H:%M:%S" 2>/dev/null || date -d "+${MINUTES} minutes" +"%H:%M:%S" 2>/dev/null)
+WHOLE_SECONDS=$(echo "scale=0; ($SECONDS_TO_WAIT + 0.5) / 1" | bc)  # bc, not printf: printf follows the locale's decimal comma
+RUN_TIME=$(date -v +${WHOLE_SECONDS}S +"%H:%M:%S" 2>/dev/null || date -d "+${WHOLE_SECONDS} seconds" +"%H:%M:%S" 2>/dev/null)
 
 # Use nohup to completely detach the sleep process
-SECONDS_TO_WAIT=$(echo "$MINUTES * 60" | bc)
 MESSAGE="Time for orchestrator check! cat $(printf %q "$NOTE_FILE")"
 nohup bash -c "sleep $SECONDS_TO_WAIT && tmux send-keys -t $(printf %q "$TARGET") -l $(printf %q "$MESSAGE") && sleep 1 && tmux send-keys -t $(printf %q "$TARGET") Enter" > /dev/null 2>&1 &
 
