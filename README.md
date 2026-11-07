@@ -222,6 +222,56 @@ The script handles all timing complexities automatically, making agent communica
 echo "Current window: $(tmux display-message -p "#{session_name}:#{window_index}")"
 ```
 
+## 🗺️ Run One Plan Across Many Repos
+
+`run_plan.py` turns a plan into **one Claude Code session per repo**, each in its own tmux
+window and git worktree, started in dependency order.
+
+```bash
+python3 run_plan.py read  ~/code/my-context/docs/tasks/ABC-123-x/plan.md   # Opus reads plan.md + tasks.md → preview
+python3 run_plan.py start ABC-123     # tmux session plan-ABC-123: orchestrator + watcher
+tmux attach -t plan-ABC-123
+python3 run_plan.py status ABC-123
+python3 run_plan.py stop ABC-123      # kills tmux only; worktrees and reports stay
+```
+
+1. **read**: Opus reads `plan.md` (and `tasks.md` beside it) and writes `sessions.json`: one
+   session per repo, its tasks, `depends_on`, and `base` when the plan names a branch to start
+   from. Work that is not code (deploys, Jira, manual checks) is listed as yours. Edit
+   `sessions.json` if the split or order is wrong.
+2. **start**: window `orchestrator` (Opus) keeps you posted; window `watcher` starts every repo
+   whose dependencies have reported `done`, each in its own window.
+3. Each repo session works in `<repos>/.tmux-orch/<KEY>/worktrees/<repo>` on branch
+   `share/<KEY>`, cut from the freshly fetched remote default branch (or `base`). Your own
+   checkouts are never touched.
+4. A session finishes by writing `sessions/<repo>/report.md` (`status: done | partial | blocked`).
+   Dependents start only after `done`, with the upstream summaries in their brief. A question
+   goes in `question.md`; the watcher tells the orchestrator, which answers or asks you.
+5. `git push`, `gh pr …`, kubectl, terraform, cloud CLIs and DB clients **ask for approval in the
+   repo's window**; force-push is denied. The watcher tells the orchestrator when a window is
+   waiting for approval, idle, or its Claude exited without a report.
+6. **`guard.py`** runs as a PreToolUse hook in every repo session (the same idea as Agents of
+   Empire's guard):
+   - Edit/Write outside the session's worktree and `sessions/<repo>/` is denied, symlinks included.
+   - Bash that writes into a main checkout or another session's worktree is denied
+     (`echo > /…/go-lib/x`, `cd /…/go-lib && git commit`, `git -C /…/go-lib checkout`); reading
+     them is fine.
+   - Rebase and force-push are denied in any spelling; every push or PR change asks, including
+     `git -C . push`, `env X=1 git push` and `make && git push`.
+
+   It matches command text, so a script that writes through an interpreter can slip past it: a
+   guard against mistakes, not a sandbox.
+
+| Variable | Default |
+|---|---|
+| `TMUX_ORCH_REPOS` | `~/code` (folder of git checkouts) |
+| `TMUX_ORCH_HOME` | `<repos>/.tmux-orch` (state, briefs, reports, worktrees) |
+| `TMUX_ORCH_REPO_MODEL` / `TMUX_ORCH_ORCH_MODEL` / `TMUX_ORCH_READ_MODEL` | `sonnet` / `opus` / `opus` (per repo: `model` in `sessions.json`) |
+| `TMUX_ORCH_IDLE_MINUTES` · `TMUX_ORCH_POLL` | `10` · `10` seconds |
+
+Tests: `python3 -m unittest discover -s tests` (the end-to-end test uses real tmux and git with a
+fake `claude`).
+
 ## 🎓 Advanced Usage
 
 ### Multi-Project Orchestration
