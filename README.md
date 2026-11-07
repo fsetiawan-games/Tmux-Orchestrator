@@ -228,11 +228,35 @@ echo "Current window: $(tmux display-message -p "#{session_name}:#{window_index}
 window and git worktree, started in dependency order.
 
 ```bash
-python3 run_plan.py read  ~/code/my-context/docs/tasks/ABC-123-x/plan.md   # Opus reads plan.md + tasks.md → preview
-python3 run_plan.py start ABC-123     # tmux session plan-ABC-123: orchestrator + watcher
+python3 run_plan.py read     ~/code/my-context/docs/tasks/ABC-123-x/plan.md   # Opus reads plan.md + tasks.md → preview
+python3 run_plan.py model    ABC-123 web-fe opus   # per repo (default sonnet), or `all`
+python3 run_plan.py exercise ABC-123                       # Opus reads the plan against each repo's real code, read-only
+python3 run_plan.py start    ABC-123                       # tmux session plan-ABC-123: orchestrator + watcher
 tmux attach -t plan-ABC-123
-python3 run_plan.py status ABC-123
-python3 run_plan.py stop ABC-123      # kills tmux only; worktrees and reports stay
+python3 run_plan.py status   ABC-123                       # status, model and cost per repo, and the total
+python3 run_plan.py stop     ABC-123                       # kills tmux only; worktrees and reports stay
+```
+
+- **model**: each repo session runs on its own model (`opus`, `sonnet`, `haiku` or a full
+  `claude-…` id). Reading the plan again keeps what you picked.
+- **exercise** (optional, as in Agents of Empire): one read-only `claude -p` per repo, in parallel,
+  in the worktree the session will use. It returns a summary, the changes by `file:line`, tests,
+  risks and open questions, printed for you and added to that session's brief as `## Exercise`.
+  Writes are denied by `guard.py`. An exercise is kept until the plan, the repo's tasks or its
+  base change. `TMUX_ORCH_EXERCISE_MODEL` (default `opus`), `TMUX_ORCH_EXERCISE_BUDGET_USD` caps
+  each repo.
+- **cost**: read and exercise record `total_cost_usd` from `claude -p`; each interactive session
+  (and the orchestrator) records it through its status line, which shows `model · $cost`.
+  `status` adds them up. On a Pro, Max or Team plan this is Claude Code's API-priced estimate,
+  not what you are billed.
+
+```
+ABC-123  tmux: plan-ABC-123 (running)
+          repo                         model    status       exercise   session
+  wave 1  promo-api          sonnet   running         $0.84     $1.10
+  wave 1  web-fe               opus     done            $0.62     $2.31
+
+  read $0.38 · exercise $1.46 · repo sessions $3.41 · orchestrator $0.20 · total $5.45
 ```
 
 1. **read**: Opus reads `plan.md` (and `tasks.md` beside it) and writes `sessions.json`: one

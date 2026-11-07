@@ -63,6 +63,45 @@ class PlanLogic(unittest.TestCase):
         r.write_text("no front matter")
         self.assertEqual(rp.report_status(r), "partial")
 
+    def test_exercise_goes_stale_when_plan_tasks_or_base_change(self):
+        data, s = {"key": "K", "plan_hash": "a"}, S("api")
+        h = rp.exercise_hash(data, s)
+        self.assertNotEqual(h, rp.exercise_hash({**data, "plan_hash": "b"}, s))
+        self.assertNotEqual(h, rp.exercise_hash(data, {**s, "base": "feat/x"}))
+        self.assertNotEqual(h, rp.exercise_hash(data, S("api", tasks=[{"id": "T9", "title": "other", "detail": ""}])))
+        self.assertEqual(h, rp.exercise_hash(data, {**s, "model": "opus"}))  # the model is not part of the plan
+
+    def test_a_failed_exercise_still_counts_what_it_cost_and_is_not_used(self):
+        home = Path(tempfile.mkdtemp())
+        old = rp.HOME, rp.CLAUDE
+        fake = home / "claude"
+        fake.write_text("#!/bin/sh\necho '{\"subtype\":\"error_max_budget_usd\",\"total_cost_usd\":0.4}'\nexit 1\n")
+        fake.chmod(0o755)
+        try:
+            rp.HOME, rp.CLAUDE = home, str(fake)
+            rp.prepare_worktree = lambda repo, key, base="": {"worktree": str(home), "base_ref": "origin/main", "base_sha": "0" * 40}
+            data = {"key": "K", "plan_hash": "a", "plan": str(home / "plan.md")}
+            ex = rp.exercise_repo(data, S("api"))
+            self.assertIn("error", ex)
+            self.assertEqual(rp.read_costs("K")["exercise"], {"api": 0.4})
+            self.assertIsNone(rp.load_exercise(data, S("api")))
+            self.assertEqual(rp.exercise_state(data, S("api")), "exercise failed")
+        finally:
+            rp.HOME, rp.CLAUDE = old
+            import importlib
+            importlib.reload(rp)
+
+    def test_status_line_survives_bad_input_and_sums_processes(self):
+        d = Path(tempfile.mkdtemp())
+        run = lambda payload: subprocess.run([sys.executable, str(HERE / "statusline.py"), str(d)], input=payload,
+                                             capture_output=True, text=True)
+        r = run("not json")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("$0.00", r.stdout)
+        run(json.dumps({"session_id": "a", "model": {"display_name": "Opus 5.5"}, "cost": {"total_cost_usd": 1.5}}))
+        r = run(json.dumps({"session_id": "b", "model": {"display_name": "Opus 5.5"}, "cost": {"total_cost_usd": 0.25}}))
+        self.assertEqual(r.stdout.strip(), "Opus 5.5 · $1.75 (this run $0.25)")
+
     def test_parse_reading_structured_and_fallback(self):
         body = {"sessions": [], "unassigned": [], "notes": []}
         self.assertEqual(rp.parse_reading(json.dumps({"structured_output": body})), body)
@@ -73,12 +112,30 @@ FAKE_CLAUDE = r'''#!/usr/bin/env python3
 import json, os, re, subprocess, sys, time
 args = sys.argv[1:]
 if "-p" in args:
-    sys.stdin.read()
-    print(json.dumps({"structured_output": json.loads(os.environ["FAKE_READING"])}))
+    prompt = sys.stdin.read()
+    if "--no-session-persistence" in args:   # an exercise: answer about this worktree, at 0.25
+        repo = os.path.basename(os.getcwd())
+        assert "You are exercising" in prompt and os.path.exists(".git"), "exercise must run in the worktree"
+        settings = json.load(open(args[args.index("--settings") + 1]))
+        assert "Edit" not in settings["permissions"]["allow"] and "--writable" not in json.dumps(settings)
+        body = {"summary": f"{repo} fits the plan", "changes": [{"file": f"{repo}.go:1", "change": "add X"}],
+                "tests": [f"{repo}_test.go: TestX"], "risks": ["none"], "questions": [f"which X for {repo}?"]}
+        print(json.dumps({"structured_output": body, "total_cost_usd": 0.25}))
+    else:                                    # the reading, at 0.10
+        print(json.dumps({"structured_output": json.loads(os.environ["FAKE_READING"]), "total_cost_usd": 0.10}))
     sys.exit(0)
+
+def status_line(usd, sid):
+    """What Claude Code does on each refresh: run the settings' statusLine with the session's cost."""
+    settings = json.load(open(args[args.index("--settings") + 1]))
+    cmd = settings["statusLine"]["command"]
+    subprocess.run(cmd, shell=True, input=json.dumps({"session_id": sid, "model": {"display_name": "Fake"},
+                   "cost": {"total_cost_usd": usd}}), text=True, capture_output=True, check=True)
+
 prompt = args[-1]
 m = re.search(r"Finish by writing (\S+report\.md)", prompt)
 if not m:                     # the orchestrator: just stay up and echo what it is sent
+    status_line(0.05, "orch")
     while True:
         line = sys.stdin.readline()
         if line:
@@ -87,12 +144,16 @@ if not m:                     # the orchestrator: just stay up and echo what it 
             time.sleep(0.2)
 report = m.group(1)
 repo = os.path.basename(os.getcwd())
+model = args[args.index("--model") + 1]
+status_line(0.30, "run1")
+status_line(0.40, "run1")       # a later refresh of the same process replaces its number
+status_line(0.20, "run2")       # a second process (claude --continue) adds to it
 open("work.txt", "w").write(f"{repo} {time.time()}\n")
 subprocess.run(["git", "add", "work.txt"], check=True)
 subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", f"work in {repo}"], check=True)
 brief = open(os.path.join(os.path.dirname(report), "brief.md")).read()
 time.sleep(1)
-open(report, "w").write(f"---\nstatus: done\n---\n## Summary\n{repo} finished. upstream-seen={'Upstream sessions' in brief}\n")
+open(report, "w").write(f"---\nstatus: done\n---\n## Summary\n{repo} finished. upstream-seen={'Upstream sessions' in brief} model={model} exercise-seen={'## Exercise' in brief}\n")
 time.sleep(600)
 '''
 
@@ -142,6 +203,29 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("Wave 1", r.stdout)
         self.assertIn("deploy", r.stdout)
+        self.assertIn("(not exercised)", r.stdout)
+
+        # Pick a model: unknown names are refused, a repo gets its own, re-reading keeps it.
+        self.assertNotEqual(self.cli("model", "DEMO-1", "api", "gpt-9").returncode, 0)
+        self.assertNotEqual(self.cli("model", "DEMO-1", "ghost", "opus").returncode, 0)
+        r = self.cli("model", "DEMO-1", "api", "opus")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("api  [opus]", r.stdout)
+        self.assertEqual(self.cli("read", str(self.plan)).returncode, 0)
+        sessions = json.loads((self.home / "DEMO-1" / "sessions.json").read_text())["sessions"]
+        self.assertEqual({s["repo"]: s["model"] for s in sessions}, {"lib": "sonnet", "api": "opus", "web": "sonnet"})
+
+        # Exercise every repo in its worktree; a second run skips them; editing the plan makes them stale.
+        r = self.cli("exercise", "DEMO-1")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertIn("✓ api  $0.25", r.stdout)
+        self.assertIn("? which X for web?", r.stdout)
+        self.assertIn("Exercise cost: $0.75", r.stdout)
+        self.assertIn("Already exercised", self.cli("exercise", "DEMO-1").stdout)
+        ex = json.loads((self.home / "DEMO-1" / "sessions" / "lib" / "exercise.json").read_text())
+        self.assertEqual((ex["summary"], ex["model"], len(ex["base_sha"])), ("lib fits the plan", "opus", 40))
+        self.assertIn("(exercised, 1 open question)", self.cli("preview", "DEMO-1").stdout)
+
         r = self.cli("start", "DEMO-1")
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
 
@@ -162,6 +246,9 @@ class EndToEnd(unittest.TestCase):
         self.assertLessEqual(rep("api").stat().st_mtime, st["web"]["started_at"])
         self.assertIn("upstream-seen=False", rep("lib").read_text())
         self.assertIn("upstream-seen=True", rep("web").read_text())
+        self.assertIn("model=opus", rep("api").read_text())
+        self.assertIn("model=sonnet", rep("web").read_text())
+        self.assertIn("exercise-seen=True", rep("lib").read_text())
 
         # Each worked in its own worktree on share/DEMO-1; the main checkout is untouched.
         for r in ("lib", "api", "web"):
@@ -175,6 +262,8 @@ class EndToEnd(unittest.TestCase):
         brief = (self.home / "DEMO-1" / "sessions" / "web" / "brief.md").read_text()
         self.assertIn("api (branch share/DEMO-1)", brief)
         self.assertIn("keep it small", brief)
+        self.assertIn("## Exercise", brief)
+        self.assertIn("`web.go:1`: add X", brief)
 
         # The orchestrator heard about it.
         time.sleep(1)
@@ -203,6 +292,9 @@ class EndToEnd(unittest.TestCase):
         r = self.cli("status", "DEMO-1")
         self.assertIn("web", r.stdout)
         self.assertIn("done", r.stdout)
+        # read 0.20 (read twice) + exercise 3 x 0.25 + sessions 3 x (0.40 + 0.20) + orchestrator 0.05
+        self.assertIn("read $0.20 · exercise $0.75 · repo sessions $1.80 · orchestrator $0.05 · total $2.80", r.stdout)
+        self.assertRegex(r.stdout, r"api\s+opus\s+done\s+\$0\.25\s+\$0\.60")
 
 
 if __name__ == "__main__":

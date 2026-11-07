@@ -2,9 +2,11 @@
 """
 Run one plan as one Claude Code session per repo, in tmux, ordered by dependency.
 
-    run_plan.py read   <plan.md>          Opus reads plan.md (+ sibling tasks.md) -> sessions.json, prints the preview
-    run_plan.py start  <KEY|plan.md>      tmux session plan-<KEY>: orchestrator + watcher; the watcher starts repo sessions
-    run_plan.py status <KEY>              where every repo session stands
+    run_plan.py read     <plan.md>        Opus reads plan.md (+ sibling tasks.md) -> sessions.json, prints the preview
+    run_plan.py model    <KEY> <repo|all> <opus|sonnet|haiku|claude-...>   pick the model a repo session runs on
+    run_plan.py exercise <KEY> [repo...]  Opus reads the plan against each repo's real code, read-only, before any is written
+    run_plan.py start    <KEY|plan.md>    tmux session plan-<KEY>: orchestrator + watcher; the watcher starts repo sessions
+    run_plan.py status   <KEY>            where every repo session stands, its model and what it cost
     run_plan.py watch  <KEY>              the watcher loop (start runs it in its own window; rerun it if it died)
     run_plan.py stop   <KEY>              kill the tmux session (worktrees and reports stay)
 
@@ -12,8 +14,12 @@ Layout, all under $TMUX_ORCH_HOME (default <repos>/.tmux-orch):
 
     <KEY>/sessions.json          the reading: repo sessions, their tasks and depends_on (edit it before start if needed)
     <KEY>/state.json             watcher state
-    <KEY>/sessions/<repo>/       brief.md (in), report.md / question.md (out)
+    <KEY>/sessions/<repo>/       exercise.json, brief.md (in), report.md / question.md (out), cost.json
     <KEY>/worktrees/<repo>/      git worktree on branch share/<KEY>, cut from the remote default branch
+    <KEY>/costs.json             what read and exercise cost; sessions keep theirs in sessions/<repo>/cost.json
+
+Costs are Claude Code's own total_cost_usd: API-priced. On a subscription (Pro, Max, Team) that
+is an estimate of the equivalent API cost, not what you are billed.
 
 A repo session starts once every repo it depends on has a report with `status: done`. A report
 with `partial` or `blocked` leaves its dependents unstarted until a later report says done.
@@ -38,10 +44,67 @@ CLAUDE = os.environ.get("TMUX_ORCH_CLAUDE") or shutil.which("claude") or "claude
 READ_MODEL = os.environ.get("TMUX_ORCH_READ_MODEL", "opus")
 ORCH_MODEL = os.environ.get("TMUX_ORCH_ORCH_MODEL", "opus")
 REPO_MODEL = os.environ.get("TMUX_ORCH_REPO_MODEL", "sonnet")
+EXERCISE_MODEL = os.environ.get("TMUX_ORCH_EXERCISE_MODEL", "opus")
+EXERCISE_PARALLEL = int(os.environ.get("TMUX_ORCH_EXERCISE_PARALLEL", "4"))
+EXERCISE_BUDGET = os.environ.get("TMUX_ORCH_EXERCISE_BUDGET_USD")  # per repo, optional cap
 POLL_SECONDS = float(os.environ.get("TMUX_ORCH_POLL", "10"))
 IDLE_MINUTES = float(os.environ.get("TMUX_ORCH_IDLE_MINUTES", "10"))
 
 TERMINAL = {"done", "partial", "blocked"}
+MODEL_ALIASES = ("opus", "sonnet", "haiku")
+ORCH = "_orchestrator"  # its cost lives in sessions/_orchestrator/cost.json
+
+
+def model_ok(model: str) -> bool:
+    return model in MODEL_ALIASES or model.startswith("claude-")
+
+
+# ---------------------------------------------------------------------------------------------
+# Costs
+
+
+def cost_of(stdout: str) -> float:
+    """total_cost_usd from `claude -p --output-format json`."""
+    try:
+        return float(json.loads(stdout).get("total_cost_usd") or 0)
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def read_costs(key: str) -> dict:
+    try:
+        c = json.loads((HOME / key / "costs.json").read_text())
+    except (OSError, ValueError):
+        c = {}
+    return {"read": c.get("read", 0.0), "exercise": c.get("exercise", {})}
+
+
+def add_cost(key: str, phase: str, usd: float, repo: str = ""):
+    """read is one number (re-reading adds to it); exercise is per repo (a re-run adds too: it was spent)."""
+    c = read_costs(key)
+    if phase == "read":
+        c["read"] += usd
+    else:
+        c["exercise"][repo] = c["exercise"].get(repo, 0.0) + usd
+    f = HOME / key / "costs.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(c, indent=2))
+    tmp.replace(f)
+
+
+def session_cost(key: str, repo: str) -> float:
+    """What an interactive session spent, as its status line last reported: every Claude process
+    the window ran (a `claude --continue` after a crash starts its own count), summed."""
+    try:
+        by = json.loads((HOME / key / "sessions" / repo / "cost.json").read_text()).get("by_session", {})
+        return sum(float(v.get("usd", 0)) for v in by.values())
+    except (OSError, ValueError, AttributeError):
+        return 0.0
+
+
+def usd(x: float) -> str:
+    return "<$0.01" if 0 < x < 0.005 else f"${x:,.2f}"
 
 # ---------------------------------------------------------------------------------------------
 # Plan files and keys
@@ -141,7 +204,8 @@ def print_preview(data: dict):
             s = by_repo[r]
             after = f"  after {', '.join(s['depends_on'])}" if s.get("depends_on") else ""
             base = f"  from origin/{s['base'].removeprefix('origin/')}" if s.get("base") else ""
-            print(f"  - {r}  [{s.get('model') or REPO_MODEL}]{base}{after}")
+            ex = exercise_state(data, s)
+            print(f"  - {r}  [{s.get('model') or REPO_MODEL}]{base}{after}  ({ex})")
             for t in s["tasks"]:
                 print(f"      {t.get('id') or '-'}  {t['title']}")
     if data.get("unassigned"):
@@ -152,6 +216,12 @@ def print_preview(data: dict):
         print("\nRules every session gets:")
         for n in data["notes"]:
             print(f"  - {n}")
+    c = read_costs(data["key"])
+    spent = c["read"] + sum(c["exercise"].values())
+    if spent:
+        print(f"\nSpent so far: read {usd(c['read'])} · exercise {usd(sum(c['exercise'].values()))}")
+    print(f"\nModel: {Path(sys.argv[0]).name} model {data['key']} <repo|all> <opus|sonnet|haiku>"
+          f"   Exercise: {Path(sys.argv[0]).name} exercise {data['key']}")
     print()
 
 
@@ -211,20 +281,26 @@ def run_read(plan: Path):
          "--json-schema", json.dumps(READ_SCHEMA)],
         input=prompt, capture_output=True, text=True,
     )
+    key = plan_key(plan)
+    add_cost(key, "read", cost_of(proc.stdout))  # spent even if the answer is unusable
     if proc.returncode != 0:
         sys.exit(f"claude -p failed ({proc.returncode}):\n{proc.stderr or proc.stdout}")
     reading = parse_reading(proc.stdout)
+    print(f"Read with {READ_MODEL}: {usd(cost_of(proc.stdout))}", file=sys.stderr)
 
-    key = plan_key(plan)
     data = {
         "key": key, "plan": str(plan),
         "tasks_file": str(plan.parent / "tasks.md") if "tasks" in texts else None,
         "plan_hash": texts_hash(texts), "read_at": datetime.now().isoformat(timespec="seconds"),
         "read_model": READ_MODEL, **reading,
     }
-    for s in data["sessions"]:
-        s.setdefault("model", REPO_MODEL)
     out = HOME / key / "sessions.json"
+    try:  # a model you already picked for a repo survives reading the plan again
+        picked = {s["repo"]: s.get("model") for s in json.loads(out.read_text())["sessions"]}
+    except (OSError, ValueError, KeyError):
+        picked = {}
+    for s in data["sessions"]:
+        s["model"] = picked.get(s["repo"]) or REPO_MODEL
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 
@@ -236,6 +312,32 @@ def run_read(plan: Path):
     for p in validate(data["sessions"], repos):
         print(f"PROBLEM: {p}")
     print(f"Saved {out}\nEdit it if the split or order is wrong, then: {Path(sys.argv[0]).name} start {key}")
+
+
+def save_sessions(data: dict):
+    f = HOME / data["key"] / "sessions.json"
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(f)
+
+
+def run_model(key: str, repo: str, model: str):
+    data = load(key)
+    if not model_ok(model):
+        sys.exit(f"Unknown model {model!r}: use {', '.join(MODEL_ALIASES)} or a full id such as claude-sonnet-5-5")
+    names = [s["repo"] for s in data["sessions"]]
+    if repo != "all" and repo not in names:
+        sys.exit(f"{repo} has no session in {key}. Sessions: {', '.join(names)}")
+    for s in data["sessions"]:
+        if repo in ("all", s["repo"]):
+            s["model"] = model
+    save_sessions(data)
+    state = HOME / key / "state.json"
+    running = json.loads(state.read_text())["repos"] if state.exists() else {}
+    late = [r for r, st in running.items() if st.get("status") != "pending" and repo in ("all", r)]
+    print_preview(data)
+    if late:
+        print(f"Note: {', '.join(late)} already started; the new model applies only to sessions not yet started.")
 
 
 def parse_reading(stdout: str) -> dict:
@@ -342,6 +444,13 @@ def prepare_worktree(repo: str, key: str, base: str = "") -> dict:
             git(repo_path, "worktree", "add", str(wt), branch)
         else:
             git(repo_path, "worktree", "add", "-b", branch, str(wt), base_sha)
+    else:
+        # Reused (the exercise made it, or an earlier start): it sits where it was cut, not on
+        # whatever origin moved to since. Say so, so the brief and the exercise agree.
+        try:
+            base_sha = git(wt, "merge-base", "HEAD", base_ref)
+        except subprocess.CalledProcessError:
+            pass
     return {"worktree": str(wt), "branch": branch, "base_ref": base_ref, "base_sha": base_sha}
 
 
@@ -366,11 +475,16 @@ REPO_SETTINGS = {
 GUARDED_TOOLS = "Bash|Edit|Write|MultiEdit|NotebookEdit"
 
 
+def cost_status_line(session_dir) -> dict:
+    """Claude Code hands its status line the session's running total_cost_usd; statusline.py keeps it."""
+    return {"type": "command", "command": shlex.join([sys.executable, str(HERE / "statusline.py"), str(session_dir)])}
+
+
 def repo_settings(worktree, session_dir) -> dict:
     """Permission rules plus guard.py as a PreToolUse hook: writes stay in the worktree and session folder."""
     guard = shlex.join([sys.executable, str(HERE / "guard.py"), "--writable", str(worktree),
                         "--writable", str(session_dir), "--protect", str(REPOS), "--protect", str(HOME)])
-    return {**REPO_SETTINGS, "hooks": {"PreToolUse": [
+    return {**REPO_SETTINGS, "statusLine": cost_status_line(session_dir), "hooks": {"PreToolUse": [
         {"matcher": GUARDED_TOOLS, "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]}}
 
 
@@ -405,8 +519,8 @@ ORCH_RULES = """You are the orchestrator for plan {key} ({plan}). One Claude Cod
 - sessions.json (the split and order) is {home}/sessions.json. If the user asks to change it, edit it and restart the watcher with: {watch}"""
 
 
-def brief_for(data: dict, s: dict, info: dict, parents: list) -> str:
-    tasks = "\n\n".join(f"### {t['id'] + ' — ' if t.get('id') else ''}{t['title']}\n{t['detail']}" for t in s["tasks"])
+def brief_for(data: dict, s: dict, info: dict, parents: list, exercise=None) -> str:
+    tasks = tasks_text(s)
     upstream = "\n".join(f"- {p['repo']} (branch share/{data['key']}): report at {p['report']}\n{indent(p['summary'])}" for p in parents)
     notes = "\n".join(f"- {n}" for n in data.get("notes", []))
     return f"""# Brief: {s['repo']} for {data['key']}
@@ -429,7 +543,7 @@ Branch: {info['branch']} (cut from {info['base_ref']} @ {info['base_sha'][:12]},
 ## Rules from the plan
 
 {notes}
-''' if notes else ''}"""
+''' if notes else ''}{chr(10) + render_exercise(exercise) if exercise else ''}"""
 
 
 def indent(text: str) -> str:
@@ -447,6 +561,185 @@ def report_summary(path: Path) -> str:
     text = path.read_text()
     m = re.search(r"^## Summary\s*\n(.*?)(?=^## |\Z)", text, re.S | re.M)
     return (m.group(1) if m else text)[:1500].strip()
+
+
+# ---------------------------------------------------------------------------------------------
+# exercise: Opus reads the plan against each repo's real code, read-only, before any is written
+
+EXERCISE_SCHEMA = {
+    "type": "object",
+    "required": ["summary", "changes", "tests", "risks", "questions"],
+    "properties": {
+        "summary": {"type": "string"},
+        "changes": {"type": "array", "items": {
+            "type": "object", "required": ["file", "change"],
+            "properties": {"file": {"type": "string"}, "change": {"type": "string"}}}},
+        "tests": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "questions": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
+EXERCISE_PROMPT = """You are exercising an approved implementation plan against the real code, before anyone writes any. Do not edit anything: read only.
+
+Repo: {repo}. You are in its worktree, {worktree}, cut from {base_ref} at {sha}: the exact code the implementing session will start from.
+
+This repo's part of the plan:
+{tasks}
+
+Read the plan below, then the code it touches. Return:
+- summary: two or three sentences: what this repo's change is, and whether the plan fits the code as it is.
+- changes: each file to change and what changes in it, citing file:line for the code it touches.
+- tests: the test cases to add or update, by file and name.
+- risks: what could break, and where.
+- questions: wherever the code disagrees with the plan, or the plan leaves a decision open.
+Only what the plan asks for.
+
+{files}"""
+
+READONLY_BASH = [f"Bash({c}:*)" for c in (
+    "git log", "git show", "git diff", "git grep", "git blame", "git ls-files", "git status", "git rev-parse",
+    "ls", "cat", "head", "tail", "wc", "find", "rg", "grep", "jq", "tree", "graphify query", "graphify path",
+    "graphify explain")]
+
+
+def exercise_settings() -> dict:
+    """Read tools and read-only shell. guard.py with nothing writable denies every write, even in the worktree."""
+    guard = shlex.join([sys.executable, str(HERE / "guard.py"), "--protect", str(REPOS), "--protect", str(HOME)])
+    return {"permissions": {"allow": ["Read", "Grep", "Glob", *READONLY_BASH]},
+            "hooks": {"PreToolUse": [{"matcher": GUARDED_TOOLS, "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]}}
+
+
+def exercise_hash(data: dict, s: dict) -> str:
+    """An edited plan, other tasks or another base needs a new exercise."""
+    return hashlib.sha256(json.dumps([data.get("plan_hash"), s["repo"], s.get("base", ""), s["tasks"]],
+                                     sort_keys=True).encode()).hexdigest()[:16]
+
+
+def exercise_file(key: str, repo: str) -> Path:
+    return HOME / key / "sessions" / repo / "exercise.json"
+
+
+def load_exercise(data: dict, s: dict):
+    """The kept exercise for this exact plan and these tasks, or None."""
+    try:
+        ex = json.loads(exercise_file(data["key"], s["repo"]).read_text())
+    except (OSError, ValueError):
+        return None
+    return ex if ex.get("hash") == exercise_hash(data, s) and not ex.get("error") else None
+
+
+def exercise_state(data: dict, s: dict) -> str:
+    f = exercise_file(data["key"], s["repo"])
+    if not f.exists():
+        return "not exercised"
+    try:
+        ex = json.loads(f.read_text())
+    except ValueError:
+        return "not exercised"
+    if ex.get("hash") != exercise_hash(data, s):
+        return "exercise out of date: plan, tasks or base changed"
+    if ex.get("error"):
+        return "exercise failed"
+    q = len(ex.get("questions", []))
+    return f"exercised{f', {q} open question' + ('s' if q != 1 else '') if q else ''}"
+
+
+def tasks_text(s: dict) -> str:
+    return "\n\n".join(f"### {t['id'] + ' — ' if t.get('id') else ''}{t['title']}\n{t['detail']}" for t in s["tasks"])
+
+
+def exercise_repo(data: dict, s: dict) -> dict:
+    """One read-only `claude -p` in the repo's worktree. Always returns what it spent, even on failure."""
+    key, repo = data["key"], s["repo"]
+    sdir = HOME / key / "sessions" / repo
+    sdir.mkdir(parents=True, exist_ok=True)
+    out = {"repo": repo, "hash": exercise_hash(data, s), "model": EXERCISE_MODEL,
+           "at": datetime.now().isoformat(timespec="seconds"), "cost_usd": 0.0}
+    try:
+        info = prepare_worktree(repo, key, s.get("base", ""))
+        out.update(base_ref=info["base_ref"], base_sha=info["base_sha"])
+        plan = Path(data["plan"])
+        texts = plan_texts(plan) if plan.exists() else {}
+        files = "\n\n".join(f'<{name} path="{plan.parent / (name + ".md")}">\n{text}\n</{name}>' for name, text in texts.items())
+        prompt = EXERCISE_PROMPT.format(repo=repo, worktree=info["worktree"], base_ref=info["base_ref"],
+                                        sha=info["base_sha"][:12], tasks=tasks_text(s), files=files)
+        settings = sdir / "exercise-settings.json"
+        settings.write_text(json.dumps(exercise_settings(), indent=2))
+        cmd = [CLAUDE, "-p", "--model", EXERCISE_MODEL, "--output-format", "json", "--no-session-persistence",
+               "--settings", str(settings), "--json-schema", json.dumps(EXERCISE_SCHEMA),
+               *(["--max-budget-usd", EXERCISE_BUDGET] if EXERCISE_BUDGET else []),
+               "--tools", "Read", "Grep", "Glob", "Bash", "--permission-mode", "default"]
+        proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=info["worktree"])
+        out["cost_usd"] = cost_of(proc.stdout)
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or proc.stdout).strip()[-600:] or f"exit {proc.returncode}")
+        outer = json.loads(proc.stdout)
+        result = outer.get("structured_output")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"no structured answer ({outer.get('subtype') or 'unknown'})")
+        out.update(result)
+    except Exception as e:  # one repo failing must not lose the others, nor what this one cost
+        out["error"] = str(e)
+    exercise_file(key, repo).write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    add_cost(key, "exercise", out["cost_usd"], repo)
+    return out
+
+
+def run_exercise(key: str, only: list, force: bool):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    data = load(key)
+    names = [s["repo"] for s in data["sessions"]]
+    unknown = [r for r in only if r not in names]
+    if unknown:
+        sys.exit(f"No session for {', '.join(unknown)} in {key}. Sessions: {', '.join(names)}")
+    todo = [s for s in data["sessions"] if (not only or s["repo"] in only) and (force or not load_exercise(data, s))]
+    skipped = [s["repo"] for s in data["sessions"] if (not only or s["repo"] in only) and s not in todo]
+    if skipped:
+        print(f"Already exercised for this plan: {', '.join(skipped)} (--force to redo)")
+    if not todo:
+        return
+    print(f"Exercising {len(todo)} repo(s) with {EXERCISE_MODEL}, {min(EXERCISE_PARALLEL, len(todo))} at a time. "
+          "Read-only; this takes a few minutes per repo.\n", flush=True)
+    total = 0.0
+    with ThreadPoolExecutor(max_workers=max(1, EXERCISE_PARALLEL)) as pool:
+        for fut in as_completed([pool.submit(exercise_repo, data, s) for s in todo]):
+            ex = fut.result()
+            total += ex["cost_usd"]
+            if ex.get("error"):
+                print(f"✗ {ex['repo']}  {usd(ex['cost_usd'])}  failed: {ex['error']}\n", flush=True)
+                continue
+            print(f"✓ {ex['repo']}  {usd(ex['cost_usd'])}  {len(ex['changes'])} change(s), {len(ex['tests'])} test(s), "
+                  f"{len(ex['risks'])} risk(s)\n  {ex['summary']}", flush=True)
+            for q in ex["questions"]:
+                print(f"  ? {q}", flush=True)
+            print(flush=True)
+    print(f"Exercise cost: {usd(total)}. Details: {HOME / key / 'sessions' / '<repo>' / 'exercise.json'}")
+    print(f"Questions above are worth settling in the plan before: {Path(sys.argv[0]).name} start {key}")
+
+
+def render_exercise(ex: dict) -> str:
+    lst = lambda items: "\n".join(f"- {x}" for x in items) if items else "- (none)"
+    changes = "\n".join(f"- `{c['file']}`: {c['change']}" for c in ex.get("changes", [])) or "- (none)"
+    return f"""## Exercise
+
+{ex.get('model', 'Opus')} read the plan against this code (at {ex.get('base_sha', '')[:12]}) before you started. Follow it;
+where the code does not match it, say so in Open questions rather than improvise.
+
+{ex['summary']}
+
+### Changes
+{changes}
+
+### Tests
+{lst(ex.get('tests'))}
+
+### Risks
+{lst(ex.get('risks'))}
+
+### Open questions
+{lst(ex.get('questions'))}
+"""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -485,10 +778,15 @@ def run_start(key_or_plan: str, force: bool):
 
     me = shlex.quote(str(Path(__file__).resolve()))
     orch_settings = home / "orchestrator-settings.json"
-    orch_settings.write_text(json.dumps({"permissions": {"allow": [
+    (home / "sessions" / ORCH).mkdir(parents=True, exist_ok=True)
+    orch_settings.write_text(json.dumps({"statusLine": cost_status_line(home / "sessions" / ORCH), "permissions": {"allow": [
         "Read", f"Bash({HERE / 'send-claude-message.sh'}:*)", f"Bash(python3 {Path(__file__).resolve()}:*)",
         "Bash(tmux capture-pane:*)", "Bash(tmux list-windows:*)", "Bash(mv:*)", "Bash(cat:*)", "Bash(ls:*)",
         "Bash(git -C:*)"]}}, indent=2))
+    not_exercised = [s["repo"] for s in data["sessions"] if not load_exercise(data, s)]
+    if not_exercised:
+        print(f"Not exercised: {', '.join(not_exercised)}. Those sessions start from the plan alone "
+              f"(run `exercise {key}` first to give them Opus's reading of their code).")
     rules = ORCH_RULES.format(
         key=key, plan=data["plan"], session=sess, home=home, send=HERE / "send-claude-message.sh",
         status=f"python3 {me} status {key}", watch=f"python3 {me} watch {key} (in the watcher window)")
@@ -518,7 +816,7 @@ def launch_repo(data: dict, s: dict, state: dict, sess: str):
     info = prepare_worktree(repo, key, s.get("base", ""))
     parents = [{"repo": d, "report": str(home / "sessions" / d / "report.md"),
                 "summary": report_summary(home / "sessions" / d / "report.md")} for d in s.get("depends_on", [])]
-    (sdir / "brief.md").write_text(brief_for(data, s, info, parents))
+    (sdir / "brief.md").write_text(brief_for(data, s, info, parents, load_exercise(data, s)))
     settings = sdir / "settings.json"
     settings.write_text(json.dumps(repo_settings(info["worktree"], sdir), indent=2))
     rules = SESSION_RULES.format(brief=sdir / "brief.md", worktree=info["worktree"], session_dir=sdir,
@@ -622,15 +920,28 @@ def run_status(key: str):
     f = HOME / key / "state.json"
     state = json.loads(f.read_text()) if f.exists() else {"repos": {}}
     sess = session_name(key)
+    costs = read_costs(key)
     print(f"{key}  tmux: {sess} ({'running' if has_session(sess) else 'not running'})")
+    print(f"  {'':7} {'repo':<28} {'model':<8} {'status':<11} {'exercise':>9} {'session':>9}")
+    sessions_total = 0.0
     for wave_n, wave in enumerate(waves(data["sessions"]), 1):
         for r in wave:
+            s = next(x for x in data["sessions"] if x["repo"] == r)
             st = state["repos"].get(r, {"status": "not started"})
-            deps = next(s for s in data["sessions"] if s["repo"] == r).get("depends_on", [])
+            deps = s.get("depends_on", [])
             extra = f"  after {', '.join(deps)}" if deps else ""
             q = HOME / key / "sessions" / r / "question.md"
-            print(f"  wave {wave_n}  {r:<28} {st['status']:<9}{extra}{'  QUESTION OPEN' if q.exists() else ''}"
-                  f"{'  ' + st['error'] if st.get('error') else ''}")
+            spent = session_cost(key, r)
+            sessions_total += spent
+            print(f"  wave {wave_n:<2} {r:<28} {(s.get('model') or REPO_MODEL):<8} {st['status']:<11} "
+                  f"{usd(costs['exercise'].get(r, 0.0)):>9} {usd(spent):>9}{extra}"
+                  f"{'  QUESTION OPEN' if q.exists() else ''}{'  ' + st['error'] if st.get('error') else ''}")
+    orch = session_cost(key, ORCH)
+    exercise_total = sum(costs["exercise"].values())
+    total = costs["read"] + exercise_total + sessions_total + orch
+    print(f"\n  read {usd(costs['read'])} · exercise {usd(exercise_total)} · repo sessions {usd(sessions_total)}"
+          f" · orchestrator {usd(orch)} · total {usd(total)}")
+    print("  (Claude Code's API-priced total_cost_usd; on a Pro/Max/Team plan an estimate, not your bill)")
 
 
 def run_stop(key: str):
@@ -652,9 +963,21 @@ def main():
     for name in ("status", "watch", "stop"):
         sub.add_parser(name).add_argument("key")
     sub.add_parser("preview").add_argument("key")
+    p = sub.add_parser("model", help="pick the model a repo session runs on")
+    p.add_argument("key")
+    p.add_argument("repo", help="a repo in the plan, or all")
+    p.add_argument("model", help="opus, sonnet, haiku, or a full claude-... id")
+    p = sub.add_parser("exercise", help="Opus reads the plan against each repo's code, read-only")
+    p.add_argument("key")
+    p.add_argument("repos", nargs="*", help="only these repos (default: every session)")
+    p.add_argument("--force", action="store_true", help="redo repos already exercised for this plan")
     a = ap.parse_args()
     if a.cmd == "read":
         run_read(Path(a.plan))
+    elif a.cmd == "model":
+        run_model(a.key, a.repo, a.model)
+    elif a.cmd == "exercise":
+        run_exercise(a.key, a.repos, a.force)
     elif a.cmd == "start":
         run_start(a.plan, a.force)
     elif a.cmd == "preview":
