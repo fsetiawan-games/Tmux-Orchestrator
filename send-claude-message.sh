@@ -13,8 +13,9 @@ WINDOW="$1"
 shift  # Remove first argument, rest is the message
 MESSAGE="$*"
 
-# Send the message
-tmux send-keys -t "$WINDOW" "$MESSAGE"
+# Send the message as literal text (-l), so a message starting with "-" or naming a key
+# such as "Enter" or "C-c" is typed rather than interpreted
+tmux send-keys -t "$WINDOW" -l -- "$MESSAGE"
 
 # Wait 0.5 seconds for UI to register
 sleep 0.5
