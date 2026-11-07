@@ -8,7 +8,9 @@ TARGET=${3:-"tmux-orc:0"}
 DIR="$(cd "$(dirname "$0")" && pwd)"
 NOTE_FILE="$DIR/next_check_note.txt"
 
-if ! tmux has-session -t "${TARGET%%:*}" 2>/dev/null; then
+# Resolves session, window and (if given) pane, so session:99 or a wrong window name fails here
+# rather than when the check is due
+if ! tmux list-panes -t "$TARGET" >/dev/null 2>&1; then
     echo "Target $TARGET does not exist. Pass your own window: \$(tmux display-message -p '#{session_name}:#{window_index}')"
     exit 1
 fi
